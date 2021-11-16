@@ -101,21 +101,24 @@ func registerQuery(app *extkingpin.App) {
 	selectorLabels := cmd.Flag("selector-label", "Query selector labels that will be exposed in info endpoint (repeated).").
 		PlaceHolder("<name>=\"<value>\"").Strings()
 
-	stores := cmd.Flag("store", "Addresses of statically configured store API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect store API servers through respective DNS lookups.").
+	endpoints := cmd.Flag("endpoint", "Addresses of statically configured Thanos API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect Thanos API servers through respective DNS lookups.").
+		PlaceHolder("<endpoint>").Strings()
+
+	stores := cmd.Flag("store", "Deprecation Warning - This flag is deprecated and replaced with `endpoint`. Addresses of statically configured store API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect store API servers through respective DNS lookups.").
 		PlaceHolder("<store>").Strings()
 
 	// TODO(bwplotka): Hidden because we plan to extract discovery to separate API: https://github.com/thanos-io/thanos/issues/2600.
-	ruleEndpoints := cmd.Flag("rule", "Experimental: Addresses of statically configured rules API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect rule API servers through respective DNS lookups.").
+	ruleEndpoints := cmd.Flag("rule", "Deprecation Warning - This flag is deprecated and replaced with `endpoint`. Experimental: Addresses of statically configured rules API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect rule API servers through respective DNS lookups.").
 		Hidden().PlaceHolder("<rule>").Strings()
 
-	metadataEndpoints := cmd.Flag("metadata", "Experimental: Addresses of statically configured metadata API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect metadata API servers through respective DNS lookups.").
+	metadataEndpoints := cmd.Flag("metadata", "Deprecation Warning - This flag is deprecated and replaced with `endpoint`. Experimental: Addresses of statically configured metadata API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect metadata API servers through respective DNS lookups.").
 		Hidden().PlaceHolder("<metadata>").Strings()
 
-	exemplarEndpoints := cmd.Flag("exemplar", "Experimental: Addresses of statically configured exemplars API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect exemplars API servers through respective DNS lookups.").
+	exemplarEndpoints := cmd.Flag("exemplar", "Deprecation Warning - This flag is deprecated and replaced with `endpoint`. Experimental: Addresses of statically configured exemplars API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect exemplars API servers through respective DNS lookups.").
 		Hidden().PlaceHolder("<exemplar>").Strings()
 
 	// TODO(atunik): Hidden because we plan to extract discovery to separate API: https://github.com/thanos-io/thanos/issues/2600.
-	targetEndpoints := cmd.Flag("target", "Experimental: Addresses of statically configured target API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect target API servers through respective DNS lookups.").
+	targetEndpoints := cmd.Flag("target", "Deprecation Warning - This flag is deprecated and replaced with `endpoint`. Experimental: Addresses of statically configured target API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect target API servers through respective DNS lookups.").
 		Hidden().PlaceHolder("<target>").Strings()
 
 	strictStores := cmd.Flag("store-strict", "Addresses of only statically configured store API servers that are always used, even if the health check fails. Useful if you have a caching layer on top.").
@@ -163,6 +166,8 @@ func registerQuery(app *extkingpin.App) {
 
 	storeResponseTimeout := extkingpin.ModelDuration(cmd.Flag("store.response-timeout", "If a Store doesn't send any data in this specified duration then a Store will be ignored and partial data will be returned if it's enabled. 0 disables timeout.").Default("0ms"))
 	reqLogConfig := extkingpin.RegisterRequestLoggingFlags(cmd)
+
+	alertQueryURL := cmd.Flag("alert.query-url", "The external Thanos Query URL that would be set in all alerts 'Source' field.").String()
 
 	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
 		selectorLset, err := parseFlagLabels(*selectorLabels)
@@ -264,6 +269,7 @@ func registerQuery(app *extkingpin.App) {
 			*queryReplicaLabels,
 			selectorLset,
 			getFlagsMap(cmd.Flags()),
+			*endpoints,
 			*stores,
 			*ruleEndpoints,
 			*targetEndpoints,
@@ -285,6 +291,7 @@ func registerQuery(app *extkingpin.App) {
 			*webDisableCORS,
 			enableAtModifier,
 			enableNegativeOffset,
+			*alertQueryURL,
 			component.Query,
 		)
 	})
@@ -329,6 +336,7 @@ func runQuery(
 	queryReplicaLabels []string,
 	selectorLset labels.Labels,
 	flagsMap map[string]string,
+	endpointAddrs []string,
 	storeAddrs []string,
 	ruleAddrs []string,
 	targetAddrs []string,
@@ -350,8 +358,16 @@ func runQuery(
 	disableCORS bool,
 	enableAtModifier bool,
 	enableNegativeOffset bool,
+	alertQueryURL string,
 	comp component.Component,
 ) error {
+	if alertQueryURL == "" {
+		lastColon := strings.LastIndex(httpBindAddr, ":")
+		if lastColon != -1 {
+			alertQueryURL = fmt.Sprintf("http://localhost:%s", httpBindAddr[lastColon+1:])
+		}
+		// NOTE(GiedriusS): default is set in config.ts.
+	}
 	// TODO(bplotka in PR #513 review): Move arguments into struct.
 	duplicatedStores := promauto.With(reg).NewCounter(prometheus.CounterOpts{
 		Name: "thanos_query_duplicated_store_addresses_total",
@@ -375,6 +391,12 @@ func runQuery(
 			return errors.Errorf("%s is a dynamically specified store i.e. it uses SD and that is not permitted under strict mode. Use --store for this", store)
 		}
 	}
+
+	dnsEndpointProvider := dns.NewProvider(
+		logger,
+		extprom.WrapRegistererWithPrefix("thanos_query_endpoints_", reg),
+		dns.ResolverType(dnsSDResolver),
+	)
 
 	dnsRuleProvider := dns.NewProvider(
 		logger,
@@ -410,7 +432,14 @@ func runQuery(
 					specs = append(specs, query.NewGRPCEndpointSpec(addr, true))
 				}
 
-				for _, dnsProvider := range []*dns.Provider{dnsStoreProvider, dnsRuleProvider, dnsExemplarProvider, dnsMetadataProvider, dnsTargetProvider} {
+				for _, dnsProvider := range []*dns.Provider{
+					dnsStoreProvider,
+					dnsRuleProvider,
+					dnsExemplarProvider,
+					dnsMetadataProvider,
+					dnsTargetProvider,
+					dnsEndpointProvider,
+				} {
 					var tmpSpecs []query.EndpointSpec
 
 					for _, addr := range dnsProvider.Addresses() {
@@ -447,6 +476,8 @@ func runQuery(
 			NoStepSubqueryIntervalFn: func(int64) int64 {
 				return defaultEvaluationInterval.Milliseconds()
 			},
+			EnableNegativeOffset: enableNegativeOffset,
+			EnableAtModifier:     enableAtModifier,
 		}
 	)
 
@@ -463,6 +494,7 @@ func runQuery(
 			endpoints.Close()
 		})
 	}
+
 	// Run File Service Discovery and update the store set when the files are modified.
 	if fileSD != nil {
 		var fileSDUpdates chan []*targetgroup.Group
@@ -476,9 +508,6 @@ func runQuery(
 		}, func(error) {
 			cancelRun()
 		})
-
-		engineOpts.EnableAtModifier = enableAtModifier
-		engineOpts.EnableNegativeOffset = enableNegativeOffset
 
 		ctxUpdate, cancelUpdate := context.WithCancel(context.Background())
 		g.Add(func() error {
@@ -527,6 +556,10 @@ func runQuery(
 				if err := dnsExemplarProvider.Resolve(resolveCtx, exemplarAddrs); err != nil {
 					level.Error(logger).Log("msg", "failed to resolve addresses for exemplarsAPI", "err", err)
 				}
+				if err := dnsEndpointProvider.Resolve(resolveCtx, endpointAddrs); err != nil {
+					level.Error(logger).Log("msg", "failed to resolve addresses passed using endpoint flag", "err", err)
+
+				}
 				return nil
 			})
 		}, func(error) {
@@ -565,7 +598,7 @@ func runQuery(
 
 		ins := extpromhttp.NewInstrumentationMiddleware(reg, nil)
 		// TODO(bplotka in PR #513 review): pass all flags, not only the flags needed by prefix rewriting.
-		ui.NewQueryUI(logger, endpoints, webExternalPrefix, webPrefixHeaderName).Register(router, ins)
+		ui.NewQueryUI(logger, endpoints, webExternalPrefix, webPrefixHeaderName, alertQueryURL).Register(router, ins)
 
 		api := v1.NewQueryAPI(
 			logger,
@@ -717,6 +750,8 @@ func engineFactory(
 			ActiveQueryTracker:       eo.ActiveQueryTracker,
 			LookbackDelta:            lookbackDelta,
 			NoStepSubqueryIntervalFn: eo.NoStepSubqueryIntervalFn,
+			EnableAtModifier:         eo.EnableAtModifier,
+			EnableNegativeOffset:     eo.EnableNegativeOffset,
 		})
 	}
 	return func(maxSourceResolutionMillis int64) *promql.Engine {

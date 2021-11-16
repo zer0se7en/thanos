@@ -104,6 +104,7 @@ type bucketStoreMetrics struct {
 	blocksLoaded          prometheus.Gauge
 	blockLoads            prometheus.Counter
 	blockLoadFailures     prometheus.Counter
+	lastLoadedBlock       prometheus.Gauge
 	blockDrops            prometheus.Counter
 	blockDropFailures     prometheus.Counter
 	seriesDataTouched     *prometheus.SummaryVec
@@ -150,6 +151,10 @@ func newBucketStoreMetrics(reg prometheus.Registerer) *bucketStoreMetrics {
 	m.blocksLoaded = promauto.With(reg).NewGauge(prometheus.GaugeOpts{
 		Name: "thanos_bucket_store_blocks_loaded",
 		Help: "Number of currently loaded blocks.",
+	})
+	m.lastLoadedBlock = promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+		Name: "thanos_bucket_store_blocks_last_loaded_timestamp_seconds",
+		Help: "Timestamp when last block got loaded.",
 	})
 
 	m.seriesDataTouched = promauto.With(reg).NewSummaryVec(prometheus.SummaryOpts{
@@ -628,7 +633,7 @@ func (s *BucketStore) addBlock(ctx context.Context, meta *metadata.Meta) (err er
 	s.blocks[b.meta.ULID] = b
 
 	s.metrics.blocksLoaded.Inc()
-
+	s.metrics.lastLoadedBlock.SetToCurrentTime()
 	return nil
 }
 
@@ -676,6 +681,16 @@ func (s *BucketStore) TimeRange() (mint, maxt int64) {
 	return mint, maxt
 }
 
+func (s *BucketStore) LabelSet() []labelpb.ZLabelSet {
+	labelSets := s.advLabelSets
+
+	if s.enableCompatibilityLabel && len(labelSets) > 0 {
+		labelSets = append(labelSets, labelpb.ZLabelSet{Labels: []labelpb.ZLabel{{Name: CompatibilityTypeLabelName, Value: "store"}}})
+	}
+
+	return labelSets
+}
+
 // Info implements the storepb.StoreServer interface.
 func (s *BucketStore) Info(context.Context, *storepb.InfoRequest) (*storepb.InfoResponse, error) {
 	mint, maxt := s.TimeRange()
@@ -686,14 +701,8 @@ func (s *BucketStore) Info(context.Context, *storepb.InfoRequest) (*storepb.Info
 	}
 
 	s.mtx.RLock()
-	res.LabelSets = s.advLabelSets
+	res.LabelSets = s.LabelSet()
 	s.mtx.RUnlock()
-
-	if s.enableCompatibilityLabel && len(res.LabelSets) > 0 {
-		// This is for compatibility with Querier v0.7.0.
-		// See query.StoreCompatibilityTypeLabelName comment for details.
-		res.LabelSets = append(res.LabelSets, labelpb.ZLabelSet{Labels: []labelpb.ZLabel{{Name: CompatibilityTypeLabelName, Value: "store"}}})
-	}
 	return res, nil
 }
 
