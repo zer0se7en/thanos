@@ -21,14 +21,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/gogo/status"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/config"
-	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/timestamp"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 	"google.golang.org/grpc/codes"
@@ -360,10 +360,14 @@ type QueryOptions struct {
 	Deduplicate             bool
 	PartialResponseStrategy storepb.PartialResponseStrategy
 	Method                  string
+	MaxSourceResolution     string
 }
 
 func (p *QueryOptions) AddTo(values url.Values) error {
 	values.Add("dedup", fmt.Sprintf("%v", p.Deduplicate))
+	if len(p.MaxSourceResolution) > 0 {
+		values.Add("max_source_resolution", p.MaxSourceResolution)
+	}
 
 	var partialResponseValue string
 	switch p.PartialResponseStrategy {
@@ -451,9 +455,9 @@ func (c *Client) QueryInstant(ctx context.Context, base *url.URL, query string, 
 		if m.Error != "" {
 			return nil, nil, errors.Errorf("error: %s, type: %s", m.Error, m.ErrorType)
 		}
-
 		return nil, nil, errors.Errorf("received status code: 200, unknown response type: '%q'", m.Data.ResultType)
 	}
+
 	return vectorResult, m.Warnings, nil
 }
 

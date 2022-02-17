@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/alecthomas/units"
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	grpclogging "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/tags"
 	"github.com/oklog/run"
@@ -22,6 +22,7 @@ import (
 	commonmodel "github.com/prometheus/common/model"
 
 	extflag "github.com/efficientgo/tools/extkingpin"
+
 	blocksAPI "github.com/thanos-io/thanos/pkg/api/blocks"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
@@ -228,6 +229,7 @@ func runStore(
 		httpserver.WithListen(conf.httpConfig.bindAddress),
 		httpserver.WithGracePeriod(time.Duration(conf.httpConfig.gracePeriod)),
 		httpserver.WithTLSConfig(conf.httpConfig.tlsConfig),
+		httpserver.WithEnableH2C(true), // For groupcache.
 	)
 
 	g.Add(func() error {
@@ -255,8 +257,11 @@ func runStore(
 	if err != nil {
 		return errors.Wrap(err, "get caching bucket configuration")
 	}
+
+	r := route.New()
+
 	if len(cachingBucketConfigYaml) > 0 {
-		bkt, err = storecache.NewCachingBucketFromYaml(cachingBucketConfigYaml, bkt, logger, reg)
+		bkt, err = storecache.NewCachingBucketFromYaml(cachingBucketConfigYaml, bkt, logger, reg, r)
 		if err != nil {
 			return errors.Wrap(err, "create caching bucket")
 		}
@@ -276,13 +281,6 @@ func runStore(
 	if err != nil {
 		return errors.Wrap(err, "get content of index cache configuration")
 	}
-
-	// Ensure we close up everything properly.
-	defer func() {
-		if err != nil {
-			runutil.CloseWithLogOnErr(logger, bkt, "bucket client")
-		}
-	}()
 
 	// Create the index cache loading its config from config file, while keeping
 	// backward compatibility with the pre-config file era.
@@ -306,8 +304,8 @@ func runStore(
 			block.NewLabelShardedMetaFilter(relabelConfig),
 			block.NewConsistencyDelayMetaFilter(logger, time.Duration(conf.consistencyDelay), extprom.WrapRegistererWithPrefix("thanos_", reg)),
 			ignoreDeletionMarkFilter,
-			block.NewDeduplicateFilter(),
-		}, nil)
+			block.NewDeduplicateFilter(conf.blockMetaFetchConcurrency),
+		})
 	if err != nil {
 		return errors.Wrap(err, "meta fetcher")
 	}
@@ -388,10 +386,10 @@ func runStore(
 
 	infoSrv := info.NewInfoServer(
 		component.Store.String(),
-		info.WithLabelSet(func() []labelpb.ZLabelSet {
+		info.WithLabelSetFunc(func() []labelpb.ZLabelSet {
 			return bs.LabelSet()
 		}),
-		info.WithStoreInfo(func() *infopb.StoreInfo {
+		info.WithStoreInfoFunc(func() *infopb.StoreInfo {
 			mint, maxt := bs.TimeRange()
 			return &infopb.StoreInfo{
 				MinTime: mint,
@@ -426,7 +424,6 @@ func runStore(
 	}
 	// Add bucket UI for loaded blocks.
 	{
-		r := route.New()
 		ins := extpromhttp.NewInstrumentationMiddleware(reg, nil)
 
 		compactorView := ui.NewBucketUI(logger, "", conf.webConfig.externalPrefix, conf.webConfig.prefixHeaderName, "/loaded", conf.component)

@@ -13,14 +13,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	"github.com/gogo/status"
 	"github.com/oklog/ulid"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
-	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/relabel"
-	"github.com/prometheus/prometheus/pkg/timestamp"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/relabel"
+	"github.com/prometheus/prometheus/model/timestamp"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/weaveworks/common/httpgrpc"
 	"google.golang.org/grpc/codes"
 
@@ -77,11 +78,11 @@ func (c *swappableCache) FetchMultiPostings(ctx context.Context, blockID ulid.UL
 	return c.ptr.FetchMultiPostings(ctx, blockID, keys)
 }
 
-func (c *swappableCache) StoreSeries(ctx context.Context, blockID ulid.ULID, id uint64, v []byte) {
+func (c *swappableCache) StoreSeries(ctx context.Context, blockID ulid.ULID, id storage.SeriesRef, v []byte) {
 	c.ptr.StoreSeries(ctx, blockID, id, v)
 }
 
-func (c *swappableCache) FetchMultiSeries(ctx context.Context, blockID ulid.ULID, ids []uint64) (map[uint64][]byte, []uint64) {
+func (c *swappableCache) FetchMultiSeries(ctx context.Context, blockID ulid.ULID, ids []storage.SeriesRef) (map[storage.SeriesRef][]byte, []storage.SeriesRef) {
 	return c.ptr.FetchMultiSeries(ctx, blockID, ids)
 }
 
@@ -176,7 +177,7 @@ func prepareStoreWithTestBlocks(t testing.TB, dir string, bkt objstore.Bucket, m
 	metaFetcher, err := block.NewMetaFetcher(s.logger, 20, objstore.WithNoopInstr(bkt), dir, nil, []block.MetadataFilter{
 		block.NewTimePartitionMetaFilter(filterConf.MinTime, filterConf.MaxTime),
 		block.NewLabelShardedMetaFilter(relabelConfig),
-	}, nil)
+	})
 	testutil.Ok(t, err)
 
 	reg := prometheus.NewRegistry()

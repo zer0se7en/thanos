@@ -12,8 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	grpc_logging "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/tags"
 	"github.com/oklog/run"
 	"github.com/opentracing/opentracing-go"
@@ -23,10 +24,9 @@ import (
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/discovery/file"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 
-	grpc_logging "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
 	v1 "github.com/thanos-io/thanos/pkg/api/query"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/component"
@@ -38,6 +38,8 @@ import (
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
 	"github.com/thanos-io/thanos/pkg/gate"
+	"github.com/thanos-io/thanos/pkg/info"
+	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/logging"
 	"github.com/thanos-io/thanos/pkg/metadata"
 	"github.com/thanos-io/thanos/pkg/prober"
@@ -47,6 +49,7 @@ import (
 	grpcserver "github.com/thanos-io/thanos/pkg/server/grpc"
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
 	"github.com/thanos-io/thanos/pkg/store"
+	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/targets"
 	"github.com/thanos-io/thanos/pkg/tls"
 	"github.com/thanos-io/thanos/pkg/ui"
@@ -55,6 +58,7 @@ import (
 const (
 	promqlNegativeOffset = "promql-negative-offset"
 	promqlAtModifier     = "promql-at-modifier"
+	queryPushdown        = "query-pushdown"
 )
 
 // registerQuery registers a query command.
@@ -101,28 +105,31 @@ func registerQuery(app *extkingpin.App) {
 	selectorLabels := cmd.Flag("selector-label", "Query selector labels that will be exposed in info endpoint (repeated).").
 		PlaceHolder("<name>=\"<value>\"").Strings()
 
-	endpoints := cmd.Flag("endpoint", "Addresses of statically configured Thanos API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect Thanos API servers through respective DNS lookups.").
-		PlaceHolder("<endpoint>").Strings()
+	endpoints := extkingpin.Addrs(cmd.Flag("endpoint", "Addresses of statically configured Thanos API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect Thanos API servers through respective DNS lookups.").
+		PlaceHolder("<endpoint>"))
 
-	stores := cmd.Flag("store", "Deprecation Warning - This flag is deprecated and replaced with `endpoint`. Addresses of statically configured store API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect store API servers through respective DNS lookups.").
-		PlaceHolder("<store>").Strings()
+	stores := extkingpin.Addrs(cmd.Flag("store", "Deprecation Warning - This flag is deprecated and replaced with `endpoint`. Addresses of statically configured store API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect store API servers through respective DNS lookups.").
+		PlaceHolder("<store>"))
 
 	// TODO(bwplotka): Hidden because we plan to extract discovery to separate API: https://github.com/thanos-io/thanos/issues/2600.
-	ruleEndpoints := cmd.Flag("rule", "Deprecation Warning - This flag is deprecated and replaced with `endpoint`. Experimental: Addresses of statically configured rules API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect rule API servers through respective DNS lookups.").
-		Hidden().PlaceHolder("<rule>").Strings()
+	ruleEndpoints := extkingpin.Addrs(cmd.Flag("rule", "Deprecation Warning - This flag is deprecated and replaced with `endpoint`. Experimental: Addresses of statically configured rules API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect rule API servers through respective DNS lookups.").
+		Hidden().PlaceHolder("<rule>"))
 
-	metadataEndpoints := cmd.Flag("metadata", "Deprecation Warning - This flag is deprecated and replaced with `endpoint`. Experimental: Addresses of statically configured metadata API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect metadata API servers through respective DNS lookups.").
-		Hidden().PlaceHolder("<metadata>").Strings()
+	metadataEndpoints := extkingpin.Addrs(cmd.Flag("metadata", "Deprecation Warning - This flag is deprecated and replaced with `endpoint`. Experimental: Addresses of statically configured metadata API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect metadata API servers through respective DNS lookups.").
+		Hidden().PlaceHolder("<metadata>"))
 
-	exemplarEndpoints := cmd.Flag("exemplar", "Deprecation Warning - This flag is deprecated and replaced with `endpoint`. Experimental: Addresses of statically configured exemplars API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect exemplars API servers through respective DNS lookups.").
-		Hidden().PlaceHolder("<exemplar>").Strings()
+	exemplarEndpoints := extkingpin.Addrs(cmd.Flag("exemplar", "Deprecation Warning - This flag is deprecated and replaced with `endpoint`. Experimental: Addresses of statically configured exemplars API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect exemplars API servers through respective DNS lookups.").
+		Hidden().PlaceHolder("<exemplar>"))
 
 	// TODO(atunik): Hidden because we plan to extract discovery to separate API: https://github.com/thanos-io/thanos/issues/2600.
-	targetEndpoints := cmd.Flag("target", "Deprecation Warning - This flag is deprecated and replaced with `endpoint`. Experimental: Addresses of statically configured target API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect target API servers through respective DNS lookups.").
-		Hidden().PlaceHolder("<target>").Strings()
+	targetEndpoints := extkingpin.Addrs(cmd.Flag("target", "Deprecation Warning - This flag is deprecated and replaced with `endpoint`. Experimental: Addresses of statically configured target API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect target API servers through respective DNS lookups.").
+		Hidden().PlaceHolder("<target>"))
 
-	strictStores := cmd.Flag("store-strict", "Addresses of only statically configured store API servers that are always used, even if the health check fails. Useful if you have a caching layer on top.").
+	strictStores := cmd.Flag("store-strict", "Deprecation Warning - This flag is deprecated and replaced with `endpoint-strict`. Addresses of only statically configured store API servers that are always used, even if the health check fails. Useful if you have a caching layer on top.").
 		PlaceHolder("<staticstore>").Strings()
+
+	strictEndpoints := cmd.Flag("endpoint-strict", "Addresses of only statically configured Thanos API servers that are always used, even if the health check fails. Useful if you have a caching layer on top.").
+		PlaceHolder("<staticendpoint>").Strings()
 
 	fileSDFiles := cmd.Flag("store.sd-files", "Path to files that contain addresses of store API servers. The path can be a glob pattern (repeatable).").
 		PlaceHolder("<path>").Strings()
@@ -154,7 +161,7 @@ func registerQuery(app *extkingpin.App) {
 	enableMetricMetadataPartialResponse := cmd.Flag("metric-metadata.partial-response", "Enable partial response for metric metadata endpoint. --no-metric-metadata.partial-response for disabling.").
 		Hidden().Default("true").Bool()
 
-	featureList := cmd.Flag("enable-feature", "Comma separated experimental feature names to enable.The current list of features is "+promqlNegativeOffset+" and "+promqlAtModifier+".").Default("").Strings()
+	featureList := cmd.Flag("enable-feature", "Comma separated experimental feature names to enable.The current list of features is "+promqlNegativeOffset+", "+promqlAtModifier+" and "+queryPushdown+".").Default("").Strings()
 
 	enableExemplarPartialResponse := cmd.Flag("exemplar.partial-response", "Enable partial response for exemplar endpoint. --no-exemplar.partial-response for disabling.").
 		Hidden().Default("true").Bool()
@@ -175,7 +182,7 @@ func registerQuery(app *extkingpin.App) {
 			return errors.Wrap(err, "parse federation labels")
 		}
 
-		var enableNegativeOffset, enableAtModifier bool
+		var enableNegativeOffset, enableAtModifier, enableQueryPushdown bool
 		for _, feature := range *featureList {
 			if feature == promqlNegativeOffset {
 				enableNegativeOffset = true
@@ -183,22 +190,9 @@ func registerQuery(app *extkingpin.App) {
 			if feature == promqlAtModifier {
 				enableAtModifier = true
 			}
-		}
-
-		if dup := firstDuplicate(*stores); dup != "" {
-			return errors.Errorf("Address %s is duplicated for --store flag.", dup)
-		}
-
-		if dup := firstDuplicate(*ruleEndpoints); dup != "" {
-			return errors.Errorf("Address %s is duplicated for --rule flag.", dup)
-		}
-
-		if dup := firstDuplicate(*metadataEndpoints); dup != "" {
-			return errors.Errorf("Address %s is duplicated for --metadata flag.", dup)
-		}
-
-		if dup := firstDuplicate(*exemplarEndpoints); dup != "" {
-			return errors.Errorf("Address %s is duplicated for --exemplar flag.", dup)
+			if feature == queryPushdown {
+				enableQueryPushdown = true
+			}
 		}
 
 		httpLogOpts, err := logging.ParseHTTPOptions(*reqLogDecision, reqLogConfig)
@@ -209,10 +203,6 @@ func registerQuery(app *extkingpin.App) {
 		tagOpts, grpcLogOpts, err := logging.ParsegRPCOptions(*reqLogDecision, reqLogConfig)
 		if err != nil {
 			return errors.Wrap(err, "error while parsing config for request logging")
-		}
-
-		if dup := firstDuplicate(*targetEndpoints); dup != "" {
-			return errors.Errorf("Address %s is duplicated for --target flag.", dup)
 		}
 
 		var fileSD *file.Discovery
@@ -288,9 +278,11 @@ func registerQuery(app *extkingpin.App) {
 			time.Duration(*instantDefaultMaxSourceResolution),
 			*defaultMetadataTimeRange,
 			*strictStores,
+			*strictEndpoints,
 			*webDisableCORS,
 			enableAtModifier,
 			enableNegativeOffset,
+			enableQueryPushdown,
 			*alertQueryURL,
 			component.Query,
 		)
@@ -355,9 +347,11 @@ func runQuery(
 	instantDefaultMaxSourceResolution time.Duration,
 	defaultMetadataTimeRange time.Duration,
 	strictStores []string,
+	strictEndpoints []string,
 	disableCORS bool,
 	enableAtModifier bool,
 	enableNegativeOffset bool,
+	enableQueryPushdown bool,
 	alertQueryURL string,
 	comp component.Component,
 ) error {
@@ -389,6 +383,12 @@ func runQuery(
 	for _, store := range strictStores {
 		if dns.IsDynamicNode(store) {
 			return errors.Errorf("%s is a dynamically specified store i.e. it uses SD and that is not permitted under strict mode. Use --store for this", store)
+		}
+	}
+
+	for _, endpoint := range strictEndpoints {
+		if dns.IsDynamicNode(endpoint) {
+			return errors.Errorf("%s is a dynamically specified endpoint i.e. it uses SD and that is not permitted under strict mode. Use --endpoint for this", endpoint)
 		}
 	}
 
@@ -426,9 +426,13 @@ func runQuery(
 		endpoints = query.NewEndpointSet(
 			logger,
 			reg,
-			func() (specs []query.EndpointSpec) {
+			func() (specs []*query.GRPCEndpointSpec) {
 				// Add strict & static nodes.
 				for _, addr := range strictStores {
+					specs = append(specs, query.NewGRPCEndpointSpec(addr, true))
+				}
+
+				for _, addr := range strictEndpoints {
 					specs = append(specs, query.NewGRPCEndpointSpec(addr, true))
 				}
 
@@ -440,7 +444,7 @@ func runQuery(
 					dnsTargetProvider,
 					dnsEndpointProvider,
 				} {
-					var tmpSpecs []query.EndpointSpec
+					var tmpSpecs []*query.GRPCEndpointSpec
 
 					for _, addr := range dnsProvider.Addresses() {
 						tmpSpecs = append(tmpSpecs, query.NewGRPCEndpointSpec(addr, false))
@@ -616,6 +620,7 @@ func runQuery(
 			enableTargetPartialResponse,
 			enableMetricMetadataPartialResponse,
 			enableExemplarPartialResponse,
+			enableQueryPushdown,
 			queryReplicaLabels,
 			flagsMap,
 			defaultRangeQueryStep,
@@ -656,12 +661,29 @@ func runQuery(
 			return errors.Wrap(err, "setup gRPC server")
 		}
 
+		infoSrv := info.NewInfoServer(
+			component.Query.String(),
+			info.WithLabelSetFunc(func() []labelpb.ZLabelSet { return proxy.LabelSet() }),
+			info.WithStoreInfoFunc(func() *infopb.StoreInfo {
+				minTime, maxTime := proxy.TimeRange()
+				return &infopb.StoreInfo{
+					MinTime: minTime,
+					MaxTime: maxTime,
+				}
+			}),
+			info.WithExemplarsInfoFunc(),
+			info.WithRulesInfoFunc(),
+			info.WithMetricMetadataInfoFunc(),
+			info.WithTargetsInfoFunc(),
+		)
+
 		s := grpcserver.New(logger, reg, tracer, grpcLogOpts, tagOpts, comp, grpcProbe,
 			grpcserver.WithServer(store.RegisterStoreServer(proxy)),
 			grpcserver.WithServer(rules.RegisterRulesServer(rulesProxy)),
 			grpcserver.WithServer(targets.RegisterTargetsServer(targetsProxy)),
 			grpcserver.WithServer(metadata.RegisterMetadataServer(metadataProxy)),
 			grpcserver.WithServer(exemplars.RegisterExemplarsServer(exemplarsProxy)),
+			grpcserver.WithServer(info.RegisterInfoServer(infoSrv)),
 			grpcserver.WithListen(grpcBindAddr),
 			grpcserver.WithGracePeriod(grpcGracePeriod),
 			grpcserver.WithTLSConfig(tlsCfg),
@@ -681,8 +703,8 @@ func runQuery(
 	return nil
 }
 
-func removeDuplicateEndpointSpecs(logger log.Logger, duplicatedStores prometheus.Counter, specs []query.EndpointSpec) []query.EndpointSpec {
-	set := make(map[string]query.EndpointSpec)
+func removeDuplicateEndpointSpecs(logger log.Logger, duplicatedStores prometheus.Counter, specs []*query.GRPCEndpointSpec) []*query.GRPCEndpointSpec {
+	set := make(map[string]*query.GRPCEndpointSpec)
 	for _, spec := range specs {
 		addr := spec.Addr()
 		if _, ok := set[addr]; ok {
@@ -691,27 +713,11 @@ func removeDuplicateEndpointSpecs(logger log.Logger, duplicatedStores prometheus
 		}
 		set[addr] = spec
 	}
-	deduplicated := make([]query.EndpointSpec, 0, len(set))
+	deduplicated := make([]*query.GRPCEndpointSpec, 0, len(set))
 	for _, value := range set {
 		deduplicated = append(deduplicated, value)
 	}
 	return deduplicated
-}
-
-// firstDuplicate returns the first duplicate string in the given string slice
-// or empty string if none was found.
-func firstDuplicate(ss []string) string {
-	set := map[string]struct{}{}
-
-	for _, s := range ss {
-		if _, ok := set[s]; ok {
-			return s
-		}
-
-		set[s] = struct{}{}
-	}
-
-	return ""
 }
 
 // engineFactory creates from 1 to 3 promql.Engines depending on

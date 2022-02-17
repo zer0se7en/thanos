@@ -10,11 +10,11 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
-	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/value"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
@@ -35,8 +35,8 @@ const (
 
 // Downsampling ranges i.e. minimum block size after which we start to downsample blocks (in seconds).
 const (
-	DownsampleRange0 = 40 * 60 * 60 * 1000      // 40 hours.
-	DownsampleRange1 = 10 * 24 * 60 * 60 * 1000 // 10 days.
+	ResLevel1DownsampleRange = 40 * 60 * 60 * 1000      // 40 hours.
+	ResLevel2DownsampleRange = 10 * 24 * 60 * 60 * 1000 // 10 days.
 )
 
 // Downsample downsamples the given block. It writes a new block into dir and returns its ID.

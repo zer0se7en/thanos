@@ -16,8 +16,8 @@ import (
 	"time"
 
 	extflag "github.com/efficientgo/tools/extkingpin"
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	grpc_logging "github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/logging"
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/tags"
 	"github.com/oklog/run"
@@ -28,8 +28,8 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/config"
-	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/relabel"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/storage"
@@ -37,9 +37,6 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/agent"
 	"github.com/prometheus/prometheus/util/strutil"
-	"github.com/thanos-io/thanos/pkg/errutil"
-	"github.com/thanos-io/thanos/pkg/extkingpin"
-	"github.com/thanos-io/thanos/pkg/httpconfig"
 	"gopkg.in/yaml.v2"
 
 	"github.com/thanos-io/thanos/pkg/alert"
@@ -47,8 +44,13 @@ import (
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/discovery/dns"
+	"github.com/thanos-io/thanos/pkg/errutil"
+	"github.com/thanos-io/thanos/pkg/extkingpin"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
+	"github.com/thanos-io/thanos/pkg/httpconfig"
+	"github.com/thanos-io/thanos/pkg/info"
+	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/logging"
 	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/prober"
@@ -59,6 +61,7 @@ import (
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
 	"github.com/thanos-io/thanos/pkg/shipper"
 	"github.com/thanos-io/thanos/pkg/store"
+	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/tls"
 	"github.com/thanos-io/thanos/pkg/tracing"
@@ -123,7 +126,7 @@ func registerRule(app *extkingpin.App) {
 	cmd.Flag("eval-interval", "The default evaluation interval to use.").
 		Default("30s").DurationVar(&conf.evalInterval)
 
-	conf.rwConfig = extflag.RegisterPathOrContent(cmd, "remote-write.config", "YAML config for the remote-write server where samples should be sent to (see https://prometheus.io/docs/prometheus/latest/configuration/configuration/#remote_write). This automatically enables stateless mode for ruler and no series will be stored in the ruler's TSDB. If an empty config (or file) is provided, the flag is ignored and ruler is run with its own TSDB.", extflag.WithEnvSubstitution())
+	conf.rwConfig = extflag.RegisterPathOrContent(cmd, "remote-write.config", "YAML config for the remote-write configurations, that specify servers where samples should be sent to (see https://prometheus.io/docs/prometheus/latest/configuration/configuration/#remote_write). This automatically enables stateless mode for ruler and no series will be stored in the ruler's TSDB. If an empty config (or file) is provided, the flag is ignored and ruler is run with its own TSDB.", extflag.WithEnvSubstitution())
 
 	reqLogDecision := cmd.Flag("log.request.decision", "Deprecation Warning - This flag would be soon deprecated, and replaced with `request.logging-config`. Request Logging for logging the start and end of requests. By default this flag is disabled. LogFinishCall: Logs the finish call of the requests. LogStartAndFinishCall: Logs the start and finish call of the requests. NoLogCall: Disable request logging.").Default("").Enum("NoLogCall", "LogFinishCall", "LogStartAndFinishCall", "")
 
@@ -153,6 +156,7 @@ func registerRule(app *extkingpin.App) {
 
 		agentOpts := &agent.Options{
 			WALCompression: *walCompression,
+			NoLockfile:     *noLockFile,
 		}
 
 		// Parse and check query configuration.
@@ -346,18 +350,21 @@ func runRule(
 	}
 
 	if len(rwCfgYAML) > 0 {
-		var rwCfg config.RemoteWriteConfig
-		if err := yaml.Unmarshal(rwCfgYAML, &rwCfg); err != nil {
-			return err
+		var rwCfg struct {
+			RemoteWriteConfigs []*config.RemoteWriteConfig `yaml:"remote_write,omitempty"`
 		}
-		walDir := filepath.Join(conf.dataDir, rwCfg.Name)
+		if err := yaml.Unmarshal(rwCfgYAML, &rwCfg); err != nil {
+			return errors.Wrapf(err, "failed to parse remote write config %v", string(rwCfgYAML))
+		}
+
+		walDir := filepath.Join(conf.dataDir, "wal")
 		// flushDeadline is set to 1m, but it is for metadata watcher only so not used here.
 		remoteStore := remote.NewStorage(logger, reg, func() (int64, error) {
 			return 0, nil
 		}, walDir, 1*time.Minute, nil)
 		if err := remoteStore.ApplyConfig(&config.Config{
 			GlobalConfig:       config.DefaultGlobalConfig,
-			RemoteWriteConfigs: []*config.RemoteWriteConfig{&rwCfg},
+			RemoteWriteConfigs: rwCfg.RemoteWriteConfigs,
 		}); err != nil {
 			return errors.Wrap(err, "applying config to remote storage")
 		}
@@ -586,10 +593,28 @@ func runRule(
 		grpcserver.WithGracePeriod(time.Duration(conf.grpc.gracePeriod)),
 		grpcserver.WithTLSConfig(tlsCfg),
 	}
+	infoOptions := []info.ServerOptionFunc{info.WithRulesInfoFunc()}
 	if tsdbDB != nil {
 		tsdbStore := store.NewTSDBStore(logger, tsdbDB, component.Rule, conf.lset)
+		infoOptions = append(
+			infoOptions,
+			info.WithLabelSetFunc(func() []labelpb.ZLabelSet {
+				return tsdbStore.LabelSet()
+			}),
+			info.WithStoreInfoFunc(func() *infopb.StoreInfo {
+				mint, maxt := tsdbStore.TimeRange()
+				return &infopb.StoreInfo{
+					MinTime: mint,
+					MaxTime: maxt,
+				}
+			}),
+		)
 		options = append(options, grpcserver.WithServer(store.RegisterStoreServer(tsdbStore)))
 	}
+
+	options = append(options, grpcserver.WithServer(
+		info.RegisterInfoServer(info.NewInfoServer(component.Rule.String(), infoOptions...)),
+	))
 	s := grpcserver.New(logger, reg, tracer, grpcLogOpts, tagOpts, comp, grpcProbe, options...)
 
 	g.Add(func() error {

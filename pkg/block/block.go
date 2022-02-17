@@ -9,7 +9,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"io/ioutil"
 	"os"
 	"path"
@@ -18,8 +17,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -144,11 +143,6 @@ func upload(ctx context.Context, logger log.Logger, bkt objstore.Bucket, bdir st
 
 	if err := meta.Write(&metaEncoded); err != nil {
 		return errors.Wrap(err, "encode meta file")
-	}
-
-	// TODO(yeya24): Remove this step.
-	if err := bkt.Upload(ctx, path.Join(DebugMetas, fmt.Sprintf("%s.json", id)), strings.NewReader(metaEncoded.String())); err != nil {
-		return cleanUp(logger, bkt, id, errors.Wrap(err, "upload debug meta file"))
 	}
 
 	if err := objstore.UploadDir(ctx, logger, bkt, path.Join(bdir, ChunksDirname), path.Join(id.String(), ChunksDirname)); err != nil {
