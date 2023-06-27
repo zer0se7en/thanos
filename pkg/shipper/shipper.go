@@ -8,12 +8,12 @@ package shipper
 import (
 	"context"
 	"encoding/json"
-	"io/ioutil"
 	"math"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
+	"sync"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -25,9 +25,10 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/fileutil"
 
+	"github.com/thanos-io/objstore"
+
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
-	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/runutil"
 )
 
@@ -77,12 +78,14 @@ type Shipper struct {
 	dir     string
 	metrics *metrics
 	bucket  objstore.Bucket
-	labels  func() labels.Labels
 	source  metadata.SourceType
 
 	uploadCompacted        bool
 	allowOutOfOrderUploads bool
 	hashFunc               metadata.HashFunc
+
+	labels func() labels.Labels
+	mtx    sync.RWMutex
 }
 
 // New creates a new shipper that detects new TSDB blocks in dir and uploads them to
@@ -117,6 +120,20 @@ func New(
 		uploadCompacted:        uploadCompacted,
 		hashFunc:               hashFunc,
 	}
+}
+
+func (s *Shipper) SetLabels(lbls labels.Labels) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	s.labels = func() labels.Labels { return lbls }
+}
+
+func (s *Shipper) getLabels() labels.Labels {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	return s.labels()
 }
 
 // Timestamps returns the minimum timestamp for which data is available and the highest timestamp
@@ -251,7 +268,7 @@ func (s *Shipper) Sync(ctx context.Context) (uploaded int, err error) {
 	meta.Uploaded = nil
 
 	var (
-		checker    = newLazyOverlapChecker(s.logger, s.bucket, s.labels)
+		checker    = newLazyOverlapChecker(s.logger, s.bucket, s.getLabels)
 		uploadErrs int
 	)
 
@@ -355,7 +372,7 @@ func (s *Shipper) upload(ctx context.Context, meta *metadata.Meta) error {
 		return errors.Wrap(err, "hard link block")
 	}
 	// Attach current labels and write a new meta file with Thanos extensions.
-	if lset := s.labels(); lset != nil {
+	if lset := s.getLabels(); lset != nil {
 		meta.Thanos.Labels = lset.Map()
 	}
 	meta.Thanos.Source = s.source
@@ -369,7 +386,7 @@ func (s *Shipper) upload(ctx context.Context, meta *metadata.Meta) error {
 // blockMetasFromOldest returns the block meta of each block found in dir
 // sorted by minTime asc.
 func (s *Shipper) blockMetasFromOldest() (metas []*metadata.Meta, _ error) {
-	fis, err := ioutil.ReadDir(s.dir)
+	fis, err := os.ReadDir(s.dir)
 	if err != nil {
 		return nil, errors.Wrap(err, "read dir")
 	}
@@ -409,7 +426,7 @@ func hardlinkBlock(src, dst string) error {
 		return errors.Wrap(err, "create chunks dir")
 	}
 
-	fis, err := ioutil.ReadDir(filepath.Join(src, block.ChunksDirname))
+	fis, err := os.ReadDir(filepath.Join(src, block.ChunksDirname))
 	if err != nil {
 		return errors.Wrap(err, "read chunk dir")
 	}
@@ -470,14 +487,15 @@ func WriteMetaFile(logger log.Logger, dir string, meta *Meta) error {
 
 // ReadMetaFile reads the given meta from <dir>/thanos.shipper.json.
 func ReadMetaFile(dir string) (*Meta, error) {
-	b, err := ioutil.ReadFile(filepath.Join(dir, filepath.Clean(MetaFilename)))
+	fpath := filepath.Join(dir, filepath.Clean(MetaFilename))
+	b, err := os.ReadFile(fpath)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "failed to read %s", fpath)
 	}
-	var m Meta
 
+	var m Meta
 	if err := json.Unmarshal(b, &m); err != nil {
-		return nil, err
+		return nil, errors.Wrapf(err, "failed to parse %s as JSON: %q", fpath, string(b))
 	}
 	if m.Version != MetaVersion1 {
 		return nil, errors.Errorf("unexpected meta file version %d", m.Version)

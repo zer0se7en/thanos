@@ -9,8 +9,8 @@ import (
 
 	"gopkg.in/yaml.v2"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/thanos-io/thanos/pkg/httpconfig"
-	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 func TestUnmarshalAPIVersion(t *testing.T) {
@@ -130,6 +130,14 @@ func TestBuildAlertmanagerConfiguration(t *testing.T) {
 		},
 		{
 			address: "://user:pass@localhost:9093",
+			err:     true,
+		},
+		{
+			address: "http://user:pass@",
+			err:     true,
+		},
+		{
+			address: "dnssrv+_http._tcp.example.com",
 			err:     true,
 		},
 	} {

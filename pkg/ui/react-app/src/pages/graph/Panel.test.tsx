@@ -1,14 +1,13 @@
 import * as React from 'react';
 import { mount, shallow } from 'enzyme';
-import Panel, { PanelOptions, PanelType } from './Panel';
-import ExpressionInput from './ExpressionInput';
+import Panel, { PanelOptions, PanelProps, PanelType } from './Panel';
 import GraphControls from './GraphControls';
 import { NavLink, TabPane } from 'reactstrap';
 import TimeInput from './TimeInput';
 import DataTable from './DataTable';
 import { GraphTabContent } from './GraphTabContent';
 
-const defaultProps = {
+const defaultProps: PanelProps = {
   id: 'abc123',
   useLocalTime: false,
   options: {
@@ -22,7 +21,9 @@ const defaultProps = {
     useDeduplication: true,
     usePartialResponse: false,
     storeMatches: [],
-    defaultStep: '1s',
+    engine: 'prometheus',
+    explain: false,
+    disableExplainCheckbox: false,
   },
   onOptionsChanged: (): void => {
     // Do nothing.
@@ -41,6 +42,10 @@ const defaultProps = {
   },
   stores: [],
   enableAutocomplete: true,
+  defaultStep: '1s',
+  enableHighlighting: true,
+  enableLinter: true,
+  defaultEngine: 'prometheus',
 };
 
 describe('Panel', () => {
@@ -52,6 +57,9 @@ describe('Panel', () => {
       results.push(opts);
     };
     const panel = shallow(<Panel {...defaultProps} onOptionsChanged={onOptionsChanged} />);
+    // Panel construction updates Explain checkbox prop to disbale.
+    // Hence, a result is added and dropping it.
+    results.length = 0;
     const links = panel.find(NavLink);
     [
       { panelType: 'Table', active: true },
@@ -88,6 +96,9 @@ describe('Panel', () => {
       useDeduplication: true,
       usePartialResponse: false,
       storeMatches: [],
+      engine: 'prometheus',
+      explain: false,
+      disableExplainCheckbox: false,
     };
     const graphPanel = mount(<Panel {...defaultProps} options={options} />);
     const controls = graphPanel.find(GraphControls);

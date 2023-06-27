@@ -8,9 +8,10 @@ import (
 	"fmt"
 	"math"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
+
+	"google.golang.org/grpc"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -26,14 +27,17 @@ import (
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/thanos-io/promql-engine/api"
 
-	v1 "github.com/thanos-io/thanos/pkg/api/query"
+	apiv1 "github.com/thanos-io/thanos/pkg/api/query"
+	"github.com/thanos-io/thanos/pkg/api/query/querypb"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/discovery/cache"
 	"github.com/thanos-io/thanos/pkg/discovery/dns"
 	"github.com/thanos-io/thanos/pkg/exemplars"
 	"github.com/thanos-io/thanos/pkg/extgrpc"
+	"github.com/thanos-io/thanos/pkg/extgrpc/snappy"
 	"github.com/thanos-io/thanos/pkg/extkingpin"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
@@ -61,13 +65,22 @@ const (
 	queryPushdown        = "query-pushdown"
 )
 
+type queryMode string
+
+const (
+	queryModeLocal       queryMode = "local"
+	queryModeDistributed queryMode = "distributed"
+)
+
 // registerQuery registers a query command.
 func registerQuery(app *extkingpin.App) {
 	comp := component.Query
 	cmd := app.Command(comp.String(), "Query node exposing PromQL enabled Query API with data retrieved from multiple store nodes.")
 
 	httpBindAddr, httpGracePeriod, httpTLSConfig := extkingpin.RegisterHTTPFlags(cmd)
-	grpcBindAddr, grpcGracePeriod, grpcCert, grpcKey, grpcClientCA, grpcMaxConnAge := extkingpin.RegisterGRPCFlags(cmd)
+
+	var grpcServerConfig grpcConfig
+	grpcServerConfig.registerFlag(cmd)
 
 	secure := cmd.Flag("grpc-client-tls-secure", "Use TLS when talking to the gRPC server").Default("false").Bool()
 	skipVerify := cmd.Flag("grpc-client-tls-skip-verify", "Disable TLS certificate verification i.e self signed, signed by fake CA").Default("false").Bool()
@@ -75,6 +88,8 @@ func registerQuery(app *extkingpin.App) {
 	key := cmd.Flag("grpc-client-tls-key", "TLS Key for the client's certificate").Default("").String()
 	caCert := cmd.Flag("grpc-client-tls-ca", "TLS CA Certificates to use to verify gRPC servers").Default("").String()
 	serverName := cmd.Flag("grpc-client-server-name", "Server name to verify the hostname on the returned gRPC certificates. See https://tools.ietf.org/html/rfc4366#section-3.1").Default("").String()
+	compressionOptions := strings.Join([]string{snappy.Name, compressionNone}, ", ")
+	grpcCompression := cmd.Flag("grpc-compression", "Compression algorithm to use for gRPC requests to other clients. Must be one of: "+compressionOptions).Default(compressionNone).Enum(snappy.Name, compressionNone)
 
 	webRoutePrefix := cmd.Flag("web.route-prefix", "Prefix for API and UI endpoints. This allows thanos UI to be served on a sub-path. Defaults to the value of --web.external-prefix. This option is analogous to --web.route-prefix of Prometheus.").Default("").String()
 	webExternalPrefix := cmd.Flag("web.external-prefix", "Static prefix for all HTML links and redirect URLs in the UI query web interface. Actual endpoints are still served on / or the web.route-prefix. This allows thanos UI to be served behind a reverse proxy that strips a URL sub-path.").Default("").String()
@@ -86,6 +101,14 @@ func registerQuery(app *extkingpin.App) {
 	queryTimeout := extkingpin.ModelDuration(cmd.Flag("query.timeout", "Maximum time to process query by query node.").
 		Default("2m"))
 
+	defaultEngine := cmd.Flag("query.promql-engine", "Default PromQL engine to use.").Default(string(apiv1.PromqlEnginePrometheus)).
+		Enum(string(apiv1.PromqlEnginePrometheus), string(apiv1.PromqlEngineThanos))
+
+	promqlQueryMode := cmd.Flag("query.mode", "PromQL query mode. One of: local, distributed.").
+		Hidden().
+		Default(string(queryModeLocal)).
+		Enum(string(queryModeLocal), string(queryModeDistributed))
+
 	maxConcurrentQueries := cmd.Flag("query.max-concurrent", "Maximum number of queries processed concurrently by query node.").
 		Default("20").Int()
 
@@ -94,6 +117,10 @@ func registerQuery(app *extkingpin.App) {
 
 	maxConcurrentSelects := cmd.Flag("query.max-concurrent-select", "Maximum number of select requests made concurrently per a query.").
 		Default("4").Int()
+
+	queryConnMetricLabels := cmd.Flag("query.conn-metric.label", "Optional selection of query connection metric labels to be collected from endpoint set").
+		Default(string(query.ExternalLabels), string(query.StoreType)).
+		Enums(string(query.ExternalLabels), string(query.StoreType))
 
 	queryReplicaLabels := cmd.Flag("query.replica-label", "Labels to treat as a replica indicator along which data is deduplicated. Still you will be able to query without deduplication using 'dedup=false' parameter. Data includes time series, recording rules, and alerting rules.").
 		Strings()
@@ -107,6 +134,9 @@ func registerQuery(app *extkingpin.App) {
 
 	endpoints := extkingpin.Addrs(cmd.Flag("endpoint", "Addresses of statically configured Thanos API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect Thanos API servers through respective DNS lookups.").
 		PlaceHolder("<endpoint>"))
+
+	endpointGroups := extkingpin.Addrs(cmd.Flag("endpoint-group", "Experimental: DNS name of statically configured Thanos API server groups (repeatable). Targets resolved from the DNS name will be queried in a round-robin, instead of a fanout manner. This flag should be used when connecting a Thanos Query to HA groups of Thanos components.").
+		PlaceHolder("<endpoint-group>"))
 
 	stores := extkingpin.Addrs(cmd.Flag("store", "Deprecation Warning - This flag is deprecated and replaced with `endpoint`. Addresses of statically configured store API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect store API servers through respective DNS lookups.").
 		PlaceHolder("<store>"))
@@ -131,6 +161,9 @@ func registerQuery(app *extkingpin.App) {
 	strictEndpoints := cmd.Flag("endpoint-strict", "Addresses of only statically configured Thanos API servers that are always used, even if the health check fails. Useful if you have a caching layer on top.").
 		PlaceHolder("<staticendpoint>").Strings()
 
+	strictEndpointGroups := extkingpin.Addrs(cmd.Flag("endpoint-group-strict", "Experimental: DNS name of statically configured Thanos API server groups (repeatable) that are always used, even if the health check fails.").
+		PlaceHolder("<endpoint-group-strict>"))
+
 	fileSDFiles := cmd.Flag("store.sd-files", "Path to files that contain addresses of store API servers. The path can be a glob pattern (repeatable).").
 		PlaceHolder("<path>").Strings()
 
@@ -145,6 +178,8 @@ func registerQuery(app *extkingpin.App) {
 		Default(string(dns.MiekgdnsResolverType)).Hidden().String()
 
 	unhealthyStoreTimeout := extkingpin.ModelDuration(cmd.Flag("store.unhealthy-timeout", "Timeout before an unhealthy store is cleaned from the store UI page.").Default("5m"))
+
+	endpointInfoTimeout := extkingpin.ModelDuration(cmd.Flag("endpoint.info-timeout", "Timeout of gRPC Info requests.").Default("5s").Hidden())
 
 	enableAutodownsampling := cmd.Flag("query.auto-downsampling", "Enable automatic adjustment (step / 5) to what source of data should be used in store gateways if no max_source_resolution param is specified.").
 		Default("false").Bool()
@@ -161,7 +196,9 @@ func registerQuery(app *extkingpin.App) {
 	enableMetricMetadataPartialResponse := cmd.Flag("metric-metadata.partial-response", "Enable partial response for metric metadata endpoint. --no-metric-metadata.partial-response for disabling.").
 		Hidden().Default("true").Bool()
 
-	featureList := cmd.Flag("enable-feature", "Comma separated experimental feature names to enable.The current list of features is "+promqlNegativeOffset+", "+promqlAtModifier+" and "+queryPushdown+".").Default("").Strings()
+	activeQueryDir := cmd.Flag("query.active-query-path", "Directory to log currently active queries in the queries.active file.").Default("").String()
+
+	featureList := cmd.Flag("enable-feature", "Comma separated experimental feature names to enable.The current list of features is "+queryPushdown+".").Default("").Strings()
 
 	enableExemplarPartialResponse := cmd.Flag("exemplar.partial-response", "Enable partial response for exemplar endpoint. --no-exemplar.partial-response for disabling.").
 		Hidden().Default("true").Bool()
@@ -175,23 +212,31 @@ func registerQuery(app *extkingpin.App) {
 	reqLogConfig := extkingpin.RegisterRequestLoggingFlags(cmd)
 
 	alertQueryURL := cmd.Flag("alert.query-url", "The external Thanos Query URL that would be set in all alerts 'Source' field.").String()
+	grpcProxyStrategy := cmd.Flag("grpc.proxy-strategy", "Strategy to use when proxying Series requests to leaf nodes. Hidden and only used for testing, will be removed after lazy becomes the default.").Default(string(store.EagerRetrieval)).Hidden().Enum(string(store.EagerRetrieval), string(store.LazyRetrieval))
 
-	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
+	queryTelemetryDurationQuantiles := cmd.Flag("query.telemetry.request-duration-seconds-quantiles", "The quantiles for exporting metrics about the request duration quantiles.").Default("0.1", "0.25", "0.75", "1.25", "1.75", "2.5", "3", "5", "10").Float64List()
+	queryTelemetrySamplesQuantiles := cmd.Flag("query.telemetry.request-samples-quantiles", "The quantiles for exporting metrics about the samples count quantiles.").Default("100", "1000", "10000", "100000", "1000000").Float64List()
+	queryTelemetrySeriesQuantiles := cmd.Flag("query.telemetry.request-series-seconds-quantiles", "The quantiles for exporting metrics about the series count quantiles.").Default("10", "100", "1000", "10000", "100000").Float64List()
+
+	var storeRateLimits store.SeriesSelectLimits
+	storeRateLimits.RegisterFlags(cmd)
+
+	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, debugLogging bool) error {
 		selectorLset, err := parseFlagLabels(*selectorLabels)
 		if err != nil {
 			return errors.Wrap(err, "parse federation labels")
 		}
 
-		var enableNegativeOffset, enableAtModifier, enableQueryPushdown bool
+		var enableQueryPushdown bool
 		for _, feature := range *featureList {
-			if feature == promqlNegativeOffset {
-				enableNegativeOffset = true
-			}
-			if feature == promqlAtModifier {
-				enableAtModifier = true
-			}
 			if feature == queryPushdown {
 				enableQueryPushdown = true
+			}
+			if feature == promqlAtModifier {
+				level.Warn(logger).Log("msg", "This option for --enable-feature is now permanently enabled and therefore a no-op.", "option", promqlAtModifier)
+			}
+			if feature == promqlNegativeOffset {
+				level.Warn(logger).Log("msg", "This option for --enable-feature is now permanently enabled and therefore a no-op.", "option", promqlNegativeOffset)
 			}
 		}
 
@@ -225,17 +270,14 @@ func registerQuery(app *extkingpin.App) {
 		return runQuery(
 			g,
 			logger,
+			debugLogging,
 			reg,
 			tracer,
 			httpLogOpts,
 			grpcLogOpts,
 			tagOpts,
-			*grpcBindAddr,
-			time.Duration(*grpcGracePeriod),
-			*grpcCert,
-			*grpcKey,
-			*grpcClientCA,
-			*grpcMaxConnAge,
+			grpcServerConfig,
+			*grpcCompression,
 			*secure,
 			*skipVerify,
 			*cert,
@@ -256,10 +298,12 @@ func registerQuery(app *extkingpin.App) {
 			*dynamicLookbackDelta,
 			time.Duration(*defaultEvaluationInterval),
 			time.Duration(*storeResponseTimeout),
+			*queryConnMetricLabels,
 			*queryReplicaLabels,
 			selectorLset,
 			getFlagsMap(cmd.Flags()),
 			*endpoints,
+			*endpointGroups,
 			*stores,
 			*ruleEndpoints,
 			*targetEndpoints,
@@ -271,20 +315,28 @@ func registerQuery(app *extkingpin.App) {
 			*enableTargetPartialResponse,
 			*enableMetricMetadataPartialResponse,
 			*enableExemplarPartialResponse,
+			*activeQueryDir,
 			fileSD,
 			time.Duration(*dnsSDInterval),
 			*dnsSDResolver,
 			time.Duration(*unhealthyStoreTimeout),
+			time.Duration(*endpointInfoTimeout),
 			time.Duration(*instantDefaultMaxSourceResolution),
 			*defaultMetadataTimeRange,
 			*strictStores,
 			*strictEndpoints,
+			*strictEndpointGroups,
 			*webDisableCORS,
-			enableAtModifier,
-			enableNegativeOffset,
 			enableQueryPushdown,
 			*alertQueryURL,
+			*grpcProxyStrategy,
 			component.Query,
+			*queryTelemetryDurationQuantiles,
+			*queryTelemetrySamplesQuantiles,
+			*queryTelemetrySeriesQuantiles,
+			*defaultEngine,
+			storeRateLimits,
+			queryMode(*promqlQueryMode),
 		)
 	})
 }
@@ -294,17 +346,14 @@ func registerQuery(app *extkingpin.App) {
 func runQuery(
 	g *run.Group,
 	logger log.Logger,
+	debugLogging bool,
 	reg *prometheus.Registry,
 	tracer opentracing.Tracer,
 	httpLogOpts []logging.Option,
 	grpcLogOpts []grpc_logging.Option,
 	tagOpts []tags.Option,
-	grpcBindAddr string,
-	grpcGracePeriod time.Duration,
-	grpcCert string,
-	grpcKey string,
-	grpcClientCA string,
-	grpcMaxConnAge time.Duration,
+	grpcServerConfig grpcConfig,
+	grpcCompression string,
 	secure bool,
 	skipVerify bool,
 	cert string,
@@ -325,10 +374,12 @@ func runQuery(
 	dynamicLookbackDelta bool,
 	defaultEvaluationInterval time.Duration,
 	storeResponseTimeout time.Duration,
+	queryConnMetricLabels []string,
 	queryReplicaLabels []string,
 	selectorLset labels.Labels,
 	flagsMap map[string]string,
 	endpointAddrs []string,
+	endpointGroupAddrs []string,
 	storeAddrs []string,
 	ruleAddrs []string,
 	targetAddrs []string,
@@ -340,20 +391,28 @@ func runQuery(
 	enableTargetPartialResponse bool,
 	enableMetricMetadataPartialResponse bool,
 	enableExemplarPartialResponse bool,
+	activeQueryDir string,
 	fileSD *file.Discovery,
 	dnsSDInterval time.Duration,
 	dnsSDResolver string,
 	unhealthyStoreTimeout time.Duration,
+	endpointInfoTimeout time.Duration,
 	instantDefaultMaxSourceResolution time.Duration,
 	defaultMetadataTimeRange time.Duration,
 	strictStores []string,
 	strictEndpoints []string,
+	strictEndpointGroups []string,
 	disableCORS bool,
-	enableAtModifier bool,
-	enableNegativeOffset bool,
 	enableQueryPushdown bool,
 	alertQueryURL string,
+	grpcProxyStrategy string,
 	comp component.Component,
+	queryTelemetryDurationQuantiles []float64,
+	queryTelemetrySamplesQuantiles []float64,
+	queryTelemetrySeriesQuantiles []float64,
+	defaultEngine string,
+	storeRateLimits store.SeriesSelectLimits,
+	queryMode queryMode,
 ) error {
 	if alertQueryURL == "" {
 		lastColon := strings.LastIndex(httpBindAddr, ":")
@@ -371,6 +430,9 @@ func runQuery(
 	dialOpts, err := extgrpc.StoreClientGRPCOpts(logger, reg, tracer, secure, skipVerify, cert, key, caCert, serverName)
 	if err != nil {
 		return errors.Wrap(err, "building gRPC client")
+	}
+	if grpcCompression != compressionNone {
+		dialOpts = append(dialOpts, grpc.WithDefaultCallOptions(grpc.UseCompressor(grpcCompression)))
 	}
 
 	fileSDCache := cache.New()
@@ -422,8 +484,14 @@ func runQuery(
 		dns.ResolverType(dnsSDResolver),
 	)
 
+	options := []store.ProxyStoreOption{}
+	if debugLogging {
+		options = append(options, store.WithProxyStoreDebugLogging())
+	}
+
 	var (
 		endpoints = query.NewEndpointSet(
+			time.Now,
 			logger,
 			reg,
 			func() (specs []*query.GRPCEndpointSpec) {
@@ -453,12 +521,26 @@ func runQuery(
 					specs = append(specs, tmpSpecs...)
 				}
 
+				for _, eg := range endpointGroupAddrs {
+					addr := fmt.Sprintf("dns:///%s", eg)
+					spec := query.NewGRPCEndpointSpec(addr, false, extgrpc.EndpointGroupGRPCOpts()...)
+					specs = append(specs, spec)
+				}
+
+				for _, eg := range strictEndpointGroups {
+					addr := fmt.Sprintf("dns:///%s", eg)
+					spec := query.NewGRPCEndpointSpec(addr, true, extgrpc.EndpointGroupGRPCOpts()...)
+					specs = append(specs, spec)
+				}
+
 				return specs
 			},
 			dialOpts,
 			unhealthyStoreTimeout,
+			endpointInfoTimeout,
+			queryConnMetricLabels...,
 		)
-		proxy            = store.NewProxyStore(logger, reg, endpoints.GetStoreClients, component.Query, selectorLset, storeResponseTimeout)
+		proxy            = store.NewProxyStore(logger, reg, endpoints.GetStoreClients, component.Query, selectorLset, storeResponseTimeout, store.RetrievalStrategy(grpcProxyStrategy), options...)
 		rulesProxy       = rules.NewProxy(logger, endpoints.GetRulesClients)
 		targetsProxy     = targets.NewProxy(logger, endpoints.GetTargetsClients)
 		metadataProxy    = metadata.NewProxy(logger, endpoints.GetMetricMetadataClients)
@@ -470,19 +552,6 @@ func runQuery(
 			maxConcurrentSelects,
 			queryTimeout,
 		)
-		engineOpts = promql.EngineOpts{
-			Logger: logger,
-			Reg:    reg,
-			// TODO(bwplotka): Expose this as a flag: https://github.com/thanos-io/thanos/issues/703.
-			MaxSamples:    math.MaxInt32,
-			Timeout:       queryTimeout,
-			LookbackDelta: lookbackDelta,
-			NoStepSubqueryIntervalFn: func(int64) int64 {
-				return defaultEvaluationInterval.Milliseconds()
-			},
-			EnableNegativeOffset: enableNegativeOffset,
-			EnableAtModifier:     enableAtModifier,
-		}
 	)
 
 	// Periodically update the store set with the addresses we see in our cluster.
@@ -579,6 +648,43 @@ func runQuery(
 		prober.NewInstrumentation(comp, logger, extprom.WrapRegistererWithPrefix("thanos_", reg)),
 	)
 
+	engineOpts := promql.EngineOpts{
+		Logger: logger,
+		Reg:    reg,
+		// TODO(bwplotka): Expose this as a flag: https://github.com/thanos-io/thanos/issues/703.
+		MaxSamples:    math.MaxInt32,
+		Timeout:       queryTimeout,
+		LookbackDelta: lookbackDelta,
+		NoStepSubqueryIntervalFn: func(int64) int64 {
+			return defaultEvaluationInterval.Milliseconds()
+		},
+		EnableNegativeOffset: true,
+		EnableAtModifier:     true,
+	}
+
+	// An active query tracker will be added only if the user specifies a non-default path.
+	// Otherwise, the nil active query tracker from existing engine options will be used.
+	if activeQueryDir != "" {
+		engineOpts.ActiveQueryTracker = promql.NewActiveQueryTracker(activeQueryDir, maxConcurrentQueries, logger)
+	}
+
+	var remoteEngineEndpoints api.RemoteEndpoints
+	if queryMode != queryModeLocal {
+		remoteEngineEndpoints = query.NewRemoteEndpoints(logger, endpoints.GetQueryAPIClients, query.Opts{
+			AutoDownsample:        enableAutodownsampling,
+			ReplicaLabels:         queryReplicaLabels,
+			Timeout:               queryTimeout,
+			EnablePartialResponse: enableQueryPartialResponse,
+		})
+	}
+
+	engineFactory := apiv1.NewQueryEngineFactory(
+		engineOpts,
+		remoteEngineEndpoints,
+	)
+
+	lookbackDeltaCreator := LookbackDeltaFactory(engineOpts, dynamicLookbackDelta)
+
 	// Start query API + UI HTTP server.
 	{
 		router := route.New()
@@ -604,10 +710,12 @@ func runQuery(
 		// TODO(bplotka in PR #513 review): pass all flags, not only the flags needed by prefix rewriting.
 		ui.NewQueryUI(logger, endpoints, webExternalPrefix, webPrefixHeaderName, alertQueryURL).Register(router, ins)
 
-		api := v1.NewQueryAPI(
+		api := apiv1.NewQueryAPI(
 			logger,
 			endpoints.GetEndpointStatus,
-			engineFactory(promql.NewEngine, engineOpts, dynamicLookbackDelta),
+			engineFactory,
+			apiv1.PromqlEngineType(defaultEngine),
+			lookbackDeltaCreator,
 			queryableCreator,
 			// NOTE: Will share the same replica label as the query for now.
 			rules.NewGRPCClientWithDedup(rulesProxy, queryReplicaLabels),
@@ -630,6 +738,13 @@ func runQuery(
 			gate.New(
 				extprom.WrapRegistererWithPrefix("thanos_query_concurrent_", reg),
 				maxConcurrentQueries,
+				gate.Queries,
+			),
+			store.NewSeriesStatsAggregator(
+				reg,
+				queryTelemetryDurationQuantiles,
+				queryTelemetrySamplesQuantiles,
+				queryTelemetrySeriesQuantiles,
 			),
 			reg,
 		)
@@ -656,7 +771,7 @@ func runQuery(
 	}
 	// Start query (proxy) gRPC StoreAPI.
 	{
-		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"), grpcCert, grpcKey, grpcClientCA)
+		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"), grpcServerConfig.tlsSrvCert, grpcServerConfig.tlsSrvKey, grpcServerConfig.tlsSrvClientCA)
 		if err != nil {
 			return errors.Wrap(err, "setup gRPC server")
 		}
@@ -665,29 +780,40 @@ func runQuery(
 			component.Query.String(),
 			info.WithLabelSetFunc(func() []labelpb.ZLabelSet { return proxy.LabelSet() }),
 			info.WithStoreInfoFunc(func() *infopb.StoreInfo {
-				minTime, maxTime := proxy.TimeRange()
-				return &infopb.StoreInfo{
-					MinTime: minTime,
-					MaxTime: maxTime,
+				if httpProbe.IsReady() {
+					mint, maxt := proxy.TimeRange()
+					return &infopb.StoreInfo{
+						MinTime:                      mint,
+						MaxTime:                      maxt,
+						SupportsSharding:             true,
+						SupportsWithoutReplicaLabels: true,
+						TsdbInfos:                    proxy.TSDBInfos(),
+					}
 				}
+				return nil
 			}),
 			info.WithExemplarsInfoFunc(),
 			info.WithRulesInfoFunc(),
 			info.WithMetricMetadataInfoFunc(),
 			info.WithTargetsInfoFunc(),
+			info.WithQueryAPIInfoFunc(),
 		)
 
+		defaultEngineType := querypb.EngineType(querypb.EngineType_value[defaultEngine])
+		grpcAPI := apiv1.NewGRPCAPI(time.Now, queryReplicaLabels, queryableCreator, engineFactory, defaultEngineType, lookbackDeltaCreator, instantDefaultMaxSourceResolution)
+		storeServer := store.NewLimitedStoreServer(store.NewInstrumentedStoreServer(reg, proxy), reg, storeRateLimits)
 		s := grpcserver.New(logger, reg, tracer, grpcLogOpts, tagOpts, comp, grpcProbe,
-			grpcserver.WithServer(store.RegisterStoreServer(proxy)),
+			grpcserver.WithServer(apiv1.RegisterQueryServer(grpcAPI)),
+			grpcserver.WithServer(store.RegisterStoreServer(storeServer, logger)),
 			grpcserver.WithServer(rules.RegisterRulesServer(rulesProxy)),
 			grpcserver.WithServer(targets.RegisterTargetsServer(targetsProxy)),
 			grpcserver.WithServer(metadata.RegisterMetadataServer(metadataProxy)),
 			grpcserver.WithServer(exemplars.RegisterExemplarsServer(exemplarsProxy)),
 			grpcserver.WithServer(info.RegisterInfoServer(infoSrv)),
-			grpcserver.WithListen(grpcBindAddr),
-			grpcserver.WithGracePeriod(grpcGracePeriod),
+			grpcserver.WithListen(grpcServerConfig.bindAddress),
+			grpcserver.WithGracePeriod(grpcServerConfig.gracePeriod),
+			grpcserver.WithMaxConnAge(grpcServerConfig.maxConnectionAge),
 			grpcserver.WithTLSConfig(tlsCfg),
-			grpcserver.WithMaxConnAge(grpcMaxConnAge),
 		)
 
 		g.Add(func() error {
@@ -720,56 +846,40 @@ func removeDuplicateEndpointSpecs(logger log.Logger, duplicatedStores prometheus
 	return deduplicated
 }
 
-// engineFactory creates from 1 to 3 promql.Engines depending on
+// LookbackDeltaFactory creates from 1 to 3 lookback deltas depending on
 // dynamicLookbackDelta and eo.LookbackDelta and returns a function
-// that returns appropriate engine for given maxSourceResolutionMillis.
-//
-// TODO: it seems like a good idea to tweak Prometheus itself
-// instead of creating several Engines here.
-func engineFactory(
-	newEngine func(promql.EngineOpts) *promql.Engine,
+// that returns appropriate lookback delta for given maxSourceResolutionMillis.
+func LookbackDeltaFactory(
 	eo promql.EngineOpts,
 	dynamicLookbackDelta bool,
-) func(int64) *promql.Engine {
+) func(int64) time.Duration {
 	resolutions := []int64{downsample.ResLevel0}
 	if dynamicLookbackDelta {
 		resolutions = []int64{downsample.ResLevel0, downsample.ResLevel1, downsample.ResLevel2}
 	}
 	var (
-		engines = make([]*promql.Engine, len(resolutions))
-		ld      = eo.LookbackDelta.Milliseconds()
+		lds = make([]time.Duration, len(resolutions))
+		ld  = eo.LookbackDelta.Milliseconds()
 	)
-	wrapReg := func(engineNum int) prometheus.Registerer {
-		return extprom.WrapRegistererWith(map[string]string{"engine": strconv.Itoa(engineNum)}, eo.Reg)
-	}
 
 	lookbackDelta := eo.LookbackDelta
 	for i, r := range resolutions {
 		if ld < r {
 			lookbackDelta = time.Duration(r) * time.Millisecond
 		}
-		engines[i] = newEngine(promql.EngineOpts{
-			Logger:                   eo.Logger,
-			Reg:                      wrapReg(i),
-			MaxSamples:               eo.MaxSamples,
-			Timeout:                  eo.Timeout,
-			ActiveQueryTracker:       eo.ActiveQueryTracker,
-			LookbackDelta:            lookbackDelta,
-			NoStepSubqueryIntervalFn: eo.NoStepSubqueryIntervalFn,
-			EnableAtModifier:         eo.EnableAtModifier,
-			EnableNegativeOffset:     eo.EnableNegativeOffset,
-		})
+
+		lds[i] = lookbackDelta
 	}
-	return func(maxSourceResolutionMillis int64) *promql.Engine {
+	return func(maxSourceResolutionMillis int64) time.Duration {
 		for i := len(resolutions) - 1; i >= 1; i-- {
 			left := resolutions[i-1]
 			if resolutions[i-1] < ld {
 				left = ld
 			}
 			if left < maxSourceResolutionMillis {
-				return engines[i]
+				return lds[i]
 			}
 		}
-		return engines[0]
+		return lds[0]
 	}
 }

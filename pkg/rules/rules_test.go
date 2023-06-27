@@ -14,14 +14,15 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/thanos-io/thanos/pkg/rules/rulespb"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
-	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/thanos-io/thanos/pkg/testutil/custom"
 )
 
 func TestMain(m *testing.M) {
-	testutil.TolerantVerifyLeakMain(m)
+	custom.TolerantVerifyLeakMain(m)
 }
 
 // testRulesAgainstExamples tests against alerts.yaml and rules.yaml examples.
@@ -59,7 +60,7 @@ func testRulesAgainstExamples(t *testing.T, dir string, server rulespb.RulesServ
 			Name: "thanos-query",
 			File: filepath.Join(dir, "alerts.yaml"),
 			Rules: []*rulespb.Rule{
-				someAlert, someAlert, someAlert, someAlert, someAlert, someAlert, someAlert,
+				someAlert, someAlert, someAlert, someAlert, someAlert, someAlert, someAlert, someAlert,
 			},
 			Interval:                60,
 			PartialResponseStrategy: storepb.PartialResponseStrategy_ABORT,
@@ -68,7 +69,7 @@ func testRulesAgainstExamples(t *testing.T, dir string, server rulespb.RulesServ
 			Name: "thanos-receive",
 			File: filepath.Join(dir, "alerts.yaml"),
 			Rules: []*rulespb.Rule{
-				someAlert, someAlert, someAlert, someAlert, someAlert, someAlert, someAlert, someAlert,
+				someAlert, someAlert, someAlert, someAlert, someAlert, someAlert, someAlert, someAlert, someAlert, someAlert,
 			},
 			Interval:                60,
 			PartialResponseStrategy: storepb.PartialResponseStrategy_ABORT,
@@ -1112,10 +1113,7 @@ func TestFilterRules(t *testing.T) {
 					},
 				},
 			},
-			want: []*rulespb.RuleGroup{{
-				Name:  "a",
-				Rules: []*rulespb.Rule{},
-			}},
+			want: []*rulespb.RuleGroup{},
 		},
 		{
 			name:        "single group with templated labels",
@@ -1140,10 +1138,7 @@ func TestFilterRules(t *testing.T) {
 					},
 				},
 			},
-			want: []*rulespb.RuleGroup{{
-				Name:  "a",
-				Rules: []*rulespb.Rule{},
-			}},
+			want: []*rulespb.RuleGroup{},
 		},
 		{
 			name:        "multiple group with labeled rules and matcher",
@@ -1258,16 +1253,7 @@ func TestFilterRules(t *testing.T) {
 					},
 				},
 			},
-			want: []*rulespb.RuleGroup{
-				{
-					Name:  "a",
-					Rules: []*rulespb.Rule{},
-				},
-				{
-					Name:  "b",
-					Rules: []*rulespb.Rule{},
-				},
-			},
+			want: []*rulespb.RuleGroup{},
 		},
 		{
 			name:        "multiple group with templated labels",
@@ -1296,16 +1282,7 @@ func TestFilterRules(t *testing.T) {
 					},
 				},
 			},
-			want: []*rulespb.RuleGroup{
-				{
-					Name:  "a",
-					Rules: []*rulespb.Rule{},
-				},
-				{
-					Name:  "b",
-					Rules: []*rulespb.Rule{},
-				},
-			},
+			want: []*rulespb.RuleGroup{},
 		},
 		{
 			name:        "multiple group with templated labels and non templated matcher",
@@ -1334,16 +1311,7 @@ func TestFilterRules(t *testing.T) {
 					},
 				},
 			},
-			want: []*rulespb.RuleGroup{
-				{
-					Name:  "a",
-					Rules: []*rulespb.Rule{},
-				},
-				{
-					Name:  "b",
-					Rules: []*rulespb.Rule{},
-				},
-			},
+			want: []*rulespb.RuleGroup{},
 		},
 		{
 			name:        "multiple group with regex matcher",

@@ -1,8 +1,9 @@
 // Copyright (c) The Thanos Authors.
 // Licensed under the Apache License 2.0.
 
-//nolint:unparam
 // TODO(kakkoyun): Fix linter issues - The pattern we use makes linter unhappy (returning unused config pointers).
+//
+//nolint:unparam
 package main
 
 import (
@@ -12,24 +13,23 @@ import (
 	extflag "github.com/efficientgo/tools/extkingpin"
 
 	"github.com/prometheus/common/model"
+
 	"github.com/thanos-io/thanos/pkg/extkingpin"
 )
 
 type grpcConfig struct {
-	bindAddress    string
-	gracePeriod    model.Duration
-	tlsSrvCert     string
-	tlsSrvKey      string
-	tlsSrvClientCA string
+	bindAddress      string
+	tlsSrvCert       string
+	tlsSrvKey        string
+	tlsSrvClientCA   string
+	gracePeriod      time.Duration
+	maxConnectionAge time.Duration
 }
 
 func (gc *grpcConfig) registerFlag(cmd extkingpin.FlagClause) *grpcConfig {
 	cmd.Flag("grpc-address",
 		"Listen ip:port address for gRPC endpoints (StoreAPI). Make sure this address is routable from other components.").
 		Default("0.0.0.0:10901").StringVar(&gc.bindAddress)
-	cmd.Flag("grpc-grace-period",
-		"Time to wait after an interrupt received for GRPC Server.").
-		Default("2m").SetValue(&gc.gracePeriod)
 	cmd.Flag("grpc-server-tls-cert",
 		"TLS Certificate for gRPC server, leave blank to disable TLS").
 		Default("").StringVar(&gc.tlsSrvCert)
@@ -39,6 +39,12 @@ func (gc *grpcConfig) registerFlag(cmd extkingpin.FlagClause) *grpcConfig {
 	cmd.Flag("grpc-server-tls-client-ca",
 		"TLS CA to verify clients against. If no client CA is specified, there is no client verification on server side. (tls.NoClientCert)").
 		Default("").StringVar(&gc.tlsSrvClientCA)
+	cmd.Flag("grpc-server-max-connection-age", "The grpc server max connection age. This controls how often to re-establish connections and redo TLS handshakes.").
+		Default("60m").DurationVar(&gc.maxConnectionAge)
+	cmd.Flag("grpc-grace-period",
+		"Time to wait after an interrupt received for GRPC Server.").
+		Default("2m").DurationVar(&gc.gracePeriod)
+
 	return gc
 }
 
@@ -63,9 +69,11 @@ func (hc *httpConfig) registerFlag(cmd extkingpin.FlagClause) *httpConfig {
 }
 
 type prometheusConfig struct {
-	url          *url.URL
-	readyTimeout time.Duration
-	httpClient   *extflag.PathOrContent
+	url               *url.URL
+	readyTimeout      time.Duration
+	getConfigInterval time.Duration
+	getConfigTimeout  time.Duration
+	httpClient        *extflag.PathOrContent
 }
 
 func (pc *prometheusConfig) registerFlag(cmd extkingpin.FlagClause) *prometheusConfig {
@@ -75,10 +83,16 @@ func (pc *prometheusConfig) registerFlag(cmd extkingpin.FlagClause) *prometheusC
 	cmd.Flag("prometheus.ready_timeout",
 		"Maximum time to wait for the Prometheus instance to start up").
 		Default("10m").DurationVar(&pc.readyTimeout)
+	cmd.Flag("prometheus.get_config_interval",
+		"How often to get Prometheus config").
+		Default("30s").DurationVar(&pc.getConfigInterval)
+	cmd.Flag("prometheus.get_config_timeout",
+		"Timeout for getting Prometheus config").
+		Default("5s").DurationVar(&pc.getConfigTimeout)
 	pc.httpClient = extflag.RegisterPathOrContent(
 		cmd,
 		"prometheus.http-client",
-		"YAML file or string with http client configs. see Format details : ...",
+		"YAML file or string with http client configs. See Format details: https://thanos.io/tip/components/sidecar.md/#configuration.",
 	)
 
 	return pc
@@ -173,6 +187,7 @@ type queryConfig struct {
 	dnsSDInterval time.Duration
 	httpMethod    string
 	dnsSDResolver string
+	step          time.Duration
 }
 
 func (qc *queryConfig) registerFlag(cmd extkingpin.FlagClause) *queryConfig {
@@ -188,7 +203,9 @@ func (qc *queryConfig) registerFlag(cmd extkingpin.FlagClause) *queryConfig {
 	cmd.Flag("query.http-method", "HTTP method to use when sending queries. Possible options: [GET, POST]").
 		Default("POST").EnumVar(&qc.httpMethod, "GET", "POST")
 	cmd.Flag("query.sd-dns-resolver", "Resolver to use. Possible options: [golang, miekgdns]").
-		Default("golang").Hidden().StringVar(&qc.dnsSDResolver)
+		Default("miekgdns").Hidden().StringVar(&qc.dnsSDResolver)
+	cmd.Flag("query.default-step", "Default range query step to use. This is only used in stateless Ruler and alert state restoration.").
+		Default("1s").DurationVar(&qc.step)
 	return qc
 }
 

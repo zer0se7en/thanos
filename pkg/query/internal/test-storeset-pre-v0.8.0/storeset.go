@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
@@ -197,6 +198,8 @@ func (s *storeRef) LabelSets() []labels.Labels {
 	return s.labelSets
 }
 
+func (s *storeRef) TSDBInfos() []infopb.TSDBInfo { return nil }
+
 func (s *storeRef) TimeRange() (int64, int64) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
@@ -204,13 +207,24 @@ func (s *storeRef) TimeRange() (int64, int64) {
 	return s.minTime, s.maxTime
 }
 
-func (s *storeRef) String() string {
-	mint, maxt := s.TimeRange()
-	return fmt.Sprintf("Addr: %s LabelSets: %v Mint: %d Maxt: %d", s.addr, labelpb.PromLabelSetsToString(s.LabelSets()), mint, maxt)
+func (s *storeRef) SupportsSharding() bool {
+	return false
 }
 
-func (s *storeRef) Addr() string {
-	return s.addr
+func (s *storeRef) SupportsWithoutReplicaLabels() bool {
+	return false
+}
+
+func (s *storeRef) String() string {
+	mint, maxt := s.TimeRange()
+	return fmt.Sprintf(
+		"Addr: %s LabelSets: %v MinTime: %d MaxTime: %d",
+		s.addr, labelpb.PromLabelSetsToString(s.LabelSets()), mint, maxt,
+	)
+}
+
+func (s *storeRef) Addr() (string, bool) {
+	return s.addr, false
 }
 
 func (s *storeRef) close() {

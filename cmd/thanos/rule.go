@@ -30,6 +30,7 @@ import (
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
+	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/storage"
@@ -37,6 +38,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/agent"
 	"github.com/prometheus/prometheus/util/strutil"
+	"github.com/thanos-io/objstore/client"
 	"gopkg.in/yaml.v2"
 
 	"github.com/thanos-io/thanos/pkg/alert"
@@ -52,7 +54,6 @@ import (
 	"github.com/thanos-io/thanos/pkg/info"
 	"github.com/thanos-io/thanos/pkg/info/infopb"
 	"github.com/thanos-io/thanos/pkg/logging"
-	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/promclient"
 	thanosrules "github.com/thanos-io/thanos/pkg/rules"
@@ -84,12 +85,16 @@ type ruleConfig struct {
 
 	rwConfig *extflag.PathOrContent
 
-	resendDelay    time.Duration
-	evalInterval   time.Duration
-	ruleFiles      []string
-	objStoreConfig *extflag.PathOrContent
-	dataDir        string
-	lset           labels.Labels
+	resendDelay       time.Duration
+	evalInterval      time.Duration
+	outageTolerance   time.Duration
+	forGracePeriod    time.Duration
+	ruleFiles         []string
+	objStoreConfig    *extflag.PathOrContent
+	dataDir           string
+	lset              labels.Labels
+	ignoredLabelNames []string
+	storeRateLimits   store.SeriesSelectLimits
 }
 
 func (rc *ruleConfig) registerFlag(cmd extkingpin.FlagClause) {
@@ -99,6 +104,7 @@ func (rc *ruleConfig) registerFlag(cmd extkingpin.FlagClause) {
 	rc.shipper.registerFlag(cmd)
 	rc.query.registerFlag(cmd)
 	rc.alertmgr.registerFlag(cmd)
+	rc.storeRateLimits.RegisterFlags(cmd)
 }
 
 // registerRule registers a rule command.
@@ -119,12 +125,18 @@ func registerRule(app *extkingpin.App) {
 	walCompression := cmd.Flag("tsdb.wal-compression", "Compress the tsdb WAL.").Default("true").Bool()
 
 	cmd.Flag("data-dir", "data directory").Default("data/").StringVar(&conf.dataDir)
-	cmd.Flag("rule-file", "Rule files that should be used by rule manager. Can be in glob format (repeated).").
+	cmd.Flag("rule-file", "Rule files that should be used by rule manager. Can be in glob format (repeated). Note that rules are not automatically detected, use SIGHUP or do HTTP POST /-/reload to re-read them.").
 		Default("rules/").StringsVar(&conf.ruleFiles)
 	cmd.Flag("resend-delay", "Minimum amount of time to wait before resending an alert to Alertmanager.").
 		Default("1m").DurationVar(&conf.resendDelay)
 	cmd.Flag("eval-interval", "The default evaluation interval to use.").
-		Default("30s").DurationVar(&conf.evalInterval)
+		Default("1m").DurationVar(&conf.evalInterval)
+	cmd.Flag("for-outage-tolerance", "Max time to tolerate prometheus outage for restoring \"for\" state of alert.").
+		Default("1h").DurationVar(&conf.outageTolerance)
+	cmd.Flag("for-grace-period", "Minimum duration between alert and restored \"for\" state. This is maintained only for alerts with configured \"for\" time greater than grace period.").
+		Default("10m").DurationVar(&conf.forGracePeriod)
+	cmd.Flag("restore-ignored-label", "Label names to be ignored when restoring alerts from the remote storage. This is only used in stateless mode.").
+		StringsVar(&conf.ignoredLabelNames)
 
 	conf.rwConfig = extflag.RegisterPathOrContent(cmd, "remote-write.config", "YAML config for the remote-write configurations, that specify servers where samples should be sent to (see https://prometheus.io/docs/prometheus/latest/configuration/configuration/#remote_write). This automatically enables stateless mode for ruler and no series will be stored in the ruler's TSDB. If an empty config (or file) is provided, the flag is ignored and ruler is run with its own TSDB.", extflag.WithEnvSubstitution())
 
@@ -320,7 +332,10 @@ func runRule(
 		extprom.WrapRegistererWithPrefix("thanos_rule_query_apis_", reg),
 		dns.ResolverType(conf.query.dnsSDResolver),
 	)
-	var queryClients []*httpconfig.Client
+	var (
+		queryClients []*httpconfig.Client
+		promClients  []*promclient.Client
+	)
 	queryClientMetrics := extpromhttp.NewClientMetrics(extprom.WrapRegistererWith(prometheus.Labels{"client": "query"}, reg))
 	for _, cfg := range queryCfg {
 		cfg.HTTPClientConfig.ClientMetrics = queryClientMetrics
@@ -334,6 +349,7 @@ func runRule(
 			return err
 		}
 		queryClients = append(queryClients, queryClient)
+		promClients = append(promClients, promclient.NewClient(queryClient, logger, "thanos-rule"))
 		// Discover and resolve query addresses.
 		addDiscoveryGroups(g, queryClient, conf.query.dnsSDInterval)
 	}
@@ -357,25 +373,29 @@ func runRule(
 			return errors.Wrapf(err, "failed to parse remote write config %v", string(rwCfgYAML))
 		}
 
-		walDir := filepath.Join(conf.dataDir, "wal")
 		// flushDeadline is set to 1m, but it is for metadata watcher only so not used here.
 		remoteStore := remote.NewStorage(logger, reg, func() (int64, error) {
 			return 0, nil
-		}, walDir, 1*time.Minute, nil)
+		}, conf.dataDir, 1*time.Minute, nil)
 		if err := remoteStore.ApplyConfig(&config.Config{
-			GlobalConfig:       config.DefaultGlobalConfig,
+			GlobalConfig: config.GlobalConfig{
+				ExternalLabels: labelsTSDBToProm(conf.lset),
+			},
 			RemoteWriteConfigs: rwCfg.RemoteWriteConfigs,
 		}); err != nil {
 			return errors.Wrap(err, "applying config to remote storage")
 		}
 
-		agentDB, err = agent.Open(logger, reg, remoteStore, walDir, agentOpts)
+		agentDB, err = agent.Open(logger, reg, remoteStore, conf.dataDir, agentOpts)
 		if err != nil {
 			return errors.Wrap(err, "start remote write agent db")
 		}
 		fanoutStore := storage.NewFanout(logger, agentDB, remoteStore)
 		appendable = fanoutStore
-		queryable = fanoutStore
+		// Use a separate queryable to restore the ALERTS firing states.
+		// We cannot use remoteStore directly because it uses remote read for
+		// query. However, remote read is not implemented in Thanos Receiver.
+		queryable = thanosrules.NewPromClientsQueryable(logger, queryClients, promClients, conf.query.httpMethod, conf.query.step, conf.ignoredLabelNames)
 	} else {
 		tsdbDB, err = tsdb.Open(conf.dataDir, log.With(logger, "component", "tsdb"), reg, tsdbOpts, nil)
 		if err != nil {
@@ -464,13 +484,13 @@ func runRule(
 	{
 		// Run rule evaluation and alert notifications.
 		notifyFunc := func(ctx context.Context, expr string, alerts ...*rules.Alert) {
-			res := make([]*alert.Alert, 0, len(alerts))
+			res := make([]*notifier.Alert, 0, len(alerts))
 			for _, alrt := range alerts {
 				// Only send actually firing alerts.
 				if alrt.State == rules.StatePending {
 					continue
 				}
-				a := &alert.Alert{
+				a := &notifier.Alert{
 					StartsAt:     alrt.FiredAt,
 					Labels:       alrt.Labels,
 					Annotations:  alrt.Annotations,
@@ -493,14 +513,16 @@ func runRule(
 			reg,
 			conf.dataDir,
 			rules.ManagerOptions{
-				NotifyFunc:  notifyFunc,
-				Logger:      logger,
-				Appendable:  appendable,
-				ExternalURL: nil,
-				Queryable:   queryable,
-				ResendDelay: conf.resendDelay,
+				NotifyFunc:      notifyFunc,
+				Logger:          logger,
+				Appendable:      appendable,
+				ExternalURL:     nil,
+				Queryable:       queryable,
+				ResendDelay:     conf.resendDelay,
+				OutageTolerance: conf.outageTolerance,
+				ForGracePeriod:  conf.forGracePeriod,
 			},
-			queryFuncCreator(logger, queryClients, metrics.duplicatedQuery, metrics.ruleEvalWarnings, conf.query.httpMethod),
+			queryFuncCreator(logger, queryClients, promClients, metrics.duplicatedQuery, metrics.ruleEvalWarnings, conf.query.httpMethod),
 			conf.lset,
 			// In our case the querying URL is the external URL because in Prometheus
 			// --web.external-url points to it i.e. it points at something where the user
@@ -590,7 +612,8 @@ func runRule(
 	options := []grpcserver.Option{
 		grpcserver.WithServer(thanosrules.RegisterRulesServer(ruleMgr)),
 		grpcserver.WithListen(conf.grpc.bindAddress),
-		grpcserver.WithGracePeriod(time.Duration(conf.grpc.gracePeriod)),
+		grpcserver.WithGracePeriod(conf.grpc.gracePeriod),
+		grpcserver.WithGracePeriod(conf.grpc.maxConnectionAge),
 		grpcserver.WithTLSConfig(tlsCfg),
 	}
 	infoOptions := []info.ServerOptionFunc{info.WithRulesInfoFunc()}
@@ -602,14 +625,21 @@ func runRule(
 				return tsdbStore.LabelSet()
 			}),
 			info.WithStoreInfoFunc(func() *infopb.StoreInfo {
-				mint, maxt := tsdbStore.TimeRange()
-				return &infopb.StoreInfo{
-					MinTime: mint,
-					MaxTime: maxt,
+				if httpProbe.IsReady() {
+					mint, maxt := tsdbStore.TimeRange()
+					return &infopb.StoreInfo{
+						MinTime:                      mint,
+						MaxTime:                      maxt,
+						SupportsSharding:             true,
+						SupportsWithoutReplicaLabels: true,
+						TsdbInfos:                    tsdbStore.TSDBInfos(),
+					}
 				}
+				return nil
 			}),
 		)
-		options = append(options, grpcserver.WithServer(store.RegisterStoreServer(tsdbStore)))
+		storeServer := store.NewLimitedStoreServer(store.NewInstrumentedStoreServer(reg, tsdbStore), reg, conf.storeRateLimits)
+		options = append(options, grpcserver.WithServer(store.RegisterStoreServer(storeServer, logger)))
 	}
 
 	options = append(options, grpcserver.WithServer(
@@ -767,24 +797,10 @@ func labelsTSDBToProm(lset labels.Labels) (res labels.Labels) {
 	return res
 }
 
-func removeDuplicateQueryEndpoints(logger log.Logger, duplicatedQueriers prometheus.Counter, urls []*url.URL) []*url.URL {
-	set := make(map[string]struct{})
-	deduplicated := make([]*url.URL, 0, len(urls))
-	for _, u := range urls {
-		if _, ok := set[u.String()]; ok {
-			level.Warn(logger).Log("msg", "duplicate query address is provided", "addr", u.String())
-			duplicatedQueriers.Inc()
-			continue
-		}
-		deduplicated = append(deduplicated, u)
-		set[u.String()] = struct{}{}
-	}
-	return deduplicated
-}
-
 func queryFuncCreator(
 	logger log.Logger,
 	queriers []*httpconfig.Client,
+	promClients []*promclient.Client,
 	duplicatedQuery prometheus.Counter,
 	ruleEvalWarnings *prometheus.CounterVec,
 	httpMethod string,
@@ -805,15 +821,10 @@ func queryFuncCreator(
 			panic(errors.Errorf("unknown partial response strategy %v", partialResponseStrategy).Error())
 		}
 
-		promClients := make([]*promclient.Client, 0, len(queriers))
-		for _, q := range queriers {
-			promClients = append(promClients, promclient.NewClient(q, logger, "thanos-rule"))
-		}
-
 		return func(ctx context.Context, q string, t time.Time) (promql.Vector, error) {
 			for _, i := range rand.Perm(len(queriers)) {
 				promClient := promClients[i]
-				endpoints := removeDuplicateQueryEndpoints(logger, duplicatedQuery, queriers[i].Endpoints())
+				endpoints := thanosrules.RemoveDuplicateQueryEndpoints(logger, duplicatedQuery, queriers[i].Endpoints())
 				for _, i := range rand.Perm(len(endpoints)) {
 					span, ctx := tracing.StartSpan(ctx, spanID)
 					v, warns, err := promClient.PromqlQueryInstant(ctx, endpoints[i], q, t, promclient.QueryOptions{

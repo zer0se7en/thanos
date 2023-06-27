@@ -14,6 +14,7 @@ import {
 } from 'reactstrap';
 import PathPrefixProps from '../types/PathPrefixProps';
 import { ThemeToggle } from '../Theme';
+import logo from './images/icon-dark.png';
 
 interface NavConfig {
   name: string;
@@ -84,14 +85,6 @@ const navConfig: { [component: string]: (NavConfig | NavDropDown)[] } = {
   ],
 };
 
-const defaultClassicUIRoute: { [component: string]: string } = {
-  query: '/classic/graph',
-  rule: '/classic/alerts',
-  bucket: '/classic',
-  compact: '/classic/loaded',
-  store: '/classic/loaded',
-};
-
 interface NavigationProps {
   thanosComponent: string;
   defaultRoute: string;
@@ -104,6 +97,7 @@ const Navigation: FC<PathPrefixProps & NavigationProps> = ({ pathPrefix, thanosC
     <Navbar className="mb-3" dark color="dark" expand="md" fixed="top">
       <NavbarToggler onClick={toggle} className="mr-2" />
       <Link className="navbar-brand" to={`${pathPrefix}${defaultRoute}`}>
+        <img src={logo} alt="thanos" style={{ width: '2rem', marginRight: '0.5rem' }} />
         Thanos - {thanosComponent[0].toUpperCase()}
         {thanosComponent.substr(1, thanosComponent.length)}
       </Link>
@@ -136,11 +130,6 @@ const Navigation: FC<PathPrefixProps & NavigationProps> = ({ pathPrefix, thanosC
           })}
           <NavItem>
             <NavLink href="https://thanos.io/tip/thanos/getting-started.md/">Help</NavLink>
-          </NavItem>
-          <NavItem>
-            <NavLink href={`${pathPrefix}${defaultClassicUIRoute[thanosComponent]}${window.location.search}`}>
-              Classic UI
-            </NavLink>
           </NavItem>
         </Nav>
       </Collapse>

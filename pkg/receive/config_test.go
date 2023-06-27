@@ -5,13 +5,12 @@ package receive
 
 import (
 	"encoding/json"
-	"io/ioutil"
 	"os"
 	"testing"
 
 	"github.com/pkg/errors"
 
-	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/efficientgo/core/testutil"
 )
 
 func TestValidateConfig(t *testing.T) {
@@ -39,7 +38,7 @@ func TestValidateConfig(t *testing.T) {
 			name: "valid config",
 			cfg: []HashringConfig{
 				{
-					Endpoints: []string{"node1"},
+					Endpoints: []Endpoint{{Address: "node1"}},
 				},
 			},
 			err: nil, // means it's valid.
@@ -49,7 +48,7 @@ func TestValidateConfig(t *testing.T) {
 			content, err := json.Marshal(tc.cfg)
 			testutil.Ok(t, err)
 
-			tmpfile, err := ioutil.TempFile("", "configwatcher_test.*.json")
+			tmpfile, err := os.CreateTemp("", "configwatcher_test.*.json")
 			testutil.Ok(t, err)
 
 			defer func() {
@@ -71,4 +70,17 @@ func TestValidateConfig(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUnmarshalEndpointSlice(t *testing.T) {
+	t.Run("Endpoints as string slice", func(t *testing.T) {
+		var endpoints []Endpoint
+		testutil.Ok(t, json.Unmarshal([]byte(`["node-1"]`), &endpoints))
+		testutil.Equals(t, endpoints, []Endpoint{{Address: "node-1"}})
+	})
+	t.Run("Endpoints as endpoints slice", func(t *testing.T) {
+		var endpoints []Endpoint
+		testutil.Ok(t, json.Unmarshal([]byte(`[{"address": "node-1", "az": "az-1"}]`), &endpoints))
+		testutil.Equals(t, endpoints, []Endpoint{{Address: "node-1", AZ: "az-1"}})
+	})
 }
